@@ -43,7 +43,7 @@ from mapping_core import (
 )
 
 
-APP_TITLE = "文件匹配与分类工具"
+APP_TITLE = "文件匹配与分类工具 v1.1.0"
 
 
 class FileMappingWindow(QMainWindow):
@@ -67,8 +67,9 @@ class FileMappingWindow(QMainWindow):
         self.source_edit = QLineEdit()
         self.target_edit = QLineEdit()
         self.result_edit = QLineEdit()
-        self.case_insensitive = QCheckBox("文件名忽略英文字母大小写（Windows 推荐）")
-        self.case_insensitive.setChecked(True)
+        self.case_insensitive = QCheckBox("文件名严格区分大小写（固定规则）；跨 WO 同名附件各保留一份")
+        self.case_insensitive.setChecked(False)
+        self.case_insensitive.setEnabled(False)
         self.include_subfolders = QCheckBox(
             "包含待匹配文件夹下的所有子文件夹（文件很多时会增加扫描时间）"
         )
@@ -279,7 +280,7 @@ class FileMappingWindow(QMainWindow):
             source_folder=Path(self.source_edit.text()),
             target_folder=Path(self.target_edit.text()),
             result_path=Path(self.result_edit.text()),
-            case_sensitive=not self.case_insensitive.isChecked(),
+            case_sensitive=True,
             include_subfolders=self.include_subfolders.isChecked(),
         )
 
@@ -320,7 +321,7 @@ class FileMappingWindow(QMainWindow):
         prompt = (
             f"确定将 {self.preview.matched_source_files:,} 个匹配文件移动到 "
             f"{self.preview.folders_to_create:,} 个分类文件夹吗？\n\n"
-            "原始 Excel 不会被修改；文件移动成功后将不再保留在原位置。"
+            "同一附件对应多个 WO 时，会复制到各 WO（增加磁盘占用），全部成功后删除源文件。"
         )
         answer = QMessageBox.warning(
             self,
@@ -386,7 +387,9 @@ class FileMappingWindow(QMainWindow):
                     summary = payload
                     self._show_execution(summary)
                     self._set_busy(False)
-                    self.move_button.setEnabled(bool(summary.cancelled and summary.rows_not_processed))
+                    self.move_button.setEnabled(False)
+                    if summary.cancelled:
+                        self.output.appendPlainText("已保留完成的文件；再次执行前请核对日志并重新预检查。")
                 elif event == "cancelled":
                     self.progress_bar.setRange(0, 100)
                     self.status_label.setText(str(payload))

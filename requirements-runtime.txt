@@ -1,0 +1,5 @@
+# Runtime only; tested with 64-bit CPython 3.12 on Windows.
+openpyxl==3.1.5
+PySide6-Essentials==6.11.2
+shiboken6==6.11.2
+et-xmlfile==2.0.0

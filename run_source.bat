@@ -1,13 +1,17 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-py -m pip install -r requirements.txt
-if errorlevel 1 goto :error
-py file_mapping_tool.py
-exit /b %errorlevel%
-
-:error
-echo.
-echo Dependency installation failed. Check Python and network access.
-pause
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" source_launcher.py run
+) else (
+    echo Please run setup_source.bat first. See SOURCE_EDITION.md for instructions.
+    pause
+    exit /b 1
+)
+if errorlevel 1 (
+    echo Startup failed. See source-launch.log. Keep this window open to read the error.
+    pause
+    exit /b 1
+)
+exit /b 0
 exit /b 1

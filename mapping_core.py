@@ -45,7 +45,7 @@ class MappingConfig:
     source_folder: Path
     target_folder: Path
     result_path: Path
-    case_sensitive: bool = False
+    case_sensitive: bool = True
     include_subfolders: bool = False
 
 
@@ -123,7 +123,8 @@ def _as_text(value: object) -> str:
 
 
 def normalize_filename(filename: str, case_sensitive: bool) -> str:
-    return filename if case_sensitive else filename.casefold()
+    # Compatibility argument retained; matching is always exact in v1.1.0.
+    return filename
 
 
 def validate_identifier(value: str) -> str | None:
@@ -306,21 +307,22 @@ class MappingEngine:
             """
             INSERT INTO target_names(norm_name, file_name, identifier, conflict)
             SELECT norm_name, MIN(file_name), MIN(identifier),
-                   CASE WHEN COUNT(DISTINCT identifier) > 1 THEN 1 ELSE 0 END
+                   0
             FROM mapping_rows
             WHERE status = 'Pending'
             GROUP BY norm_name
             """
         )
-        connection.execute(
-            """
-            UPDATE mapping_rows
-            SET status = 'Mapping conflict',
-                reason = 'The same file name is assigned to more than one identifier'
-            WHERE status = 'Pending'
-              AND norm_name IN (SELECT norm_name FROM target_names WHERE conflict = 1)
-            """
-        )
+        connection.create_function("windows_key", 1, str.casefold)
+        connection.execute("""
+            UPDATE mapping_rows SET status = 'Mapping conflict',
+                reason = 'Different identifiers resolve to the same Windows folder'
+            WHERE windows_key(identifier) IN (
+                SELECT windows_key(identifier) FROM mapping_rows
+                WHERE status = 'Pending' GROUP BY windows_key(identifier)
+                HAVING COUNT(DISTINCT identifier) > 1
+            )
+        """)
         connection.commit()
 
         target_count = connection.execute(
@@ -437,17 +439,37 @@ class MappingEngine:
                 return candidate
             counter += 1
 
-    def _pending_move_groups(self, connection: sqlite3.Connection) -> sqlite3.Cursor:
-        return connection.execute(
-            """
-            SELECT h.norm_name, MIN(r.identifier), h.source_path
-            FROM source_hits h
-            JOIN mapping_rows r ON r.norm_name = h.norm_name
-            WHERE r.status = 'Pending'
-            GROUP BY h.norm_name, h.source_path
-            ORDER BY h.norm_name, h.source_path
-            """
-        )
+    def _deliver(self, source: Path, folder: Path, move: bool) -> Path:
+        """Reserve the destination exclusively; never overwrite a competing file."""
+        folder.mkdir(parents=True, exist_ok=True)
+        while True:
+            destination = self._collision_safe_path(folder, source.name)
+            if move:
+                try:
+                    os.link(source, destination)
+                except FileExistsError:
+                    continue
+                except OSError:
+                    pass  # Cross-volume or unsupported links: exclusive copy below.
+                else:
+                    source.unlink()
+                    return destination
+            try:
+                output = destination.open("xb")
+            except FileExistsError:
+                continue
+            try:
+                with output, source.open("rb") as incoming:
+                    while chunk := incoming.read(1024 * 1024):
+                        self.control.checkpoint()
+                        output.write(chunk)
+                shutil.copystat(source, destination)
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+            if move:
+                source.unlink()
+            return destination
 
     def execute(self) -> ExecutionSummary:
         if self.preview_summary is None:
@@ -469,7 +491,20 @@ class MappingEngine:
                 """
             ).fetchone()[0]
         )
-        groups = self._pending_move_groups(connection)
+        connection.executescript("""
+            DROP TABLE IF EXISTS deliveries;
+            CREATE TABLE deliveries AS
+            SELECT DISTINCT h.norm_name, r.identifier, h.source_path,
+                   'Pending' AS status, '' AS reason
+            FROM source_hits h JOIN mapping_rows r ON r.norm_name = h.norm_name
+            WHERE r.status = 'Pending';
+            CREATE INDEX idx_deliveries_source ON deliveries(source_path);
+            CREATE INDEX idx_deliveries_row ON deliveries(norm_name, identifier);
+        """)
+        groups = connection.execute(
+            "SELECT norm_name, source_path, COUNT(*) FROM deliveries "
+            "GROUP BY norm_name, source_path ORDER BY norm_name, source_path"
+        )
         moved = 0
         cancelled = False
 
@@ -481,52 +516,70 @@ class MappingEngine:
                     ["Time", "Identifier", "File Name", "Source", "Destination", "Status", "Reason"]
                 )
 
-            for index, (norm_name, identifier, source_text) in enumerate(groups, start=1):
+            for index, (norm_name, source_text, destination_count) in enumerate(groups, start=1):
                 try:
                     self.control.checkpoint()
                 except MappingCancelled:
                     cancelled = True
                     break
-                current_status = connection.execute(
-                    "SELECT status FROM mapping_rows WHERE norm_name = ? LIMIT 1", (norm_name,)
-                ).fetchone()
-                if not current_status or current_status[0] != "Pending":
-                    continue
-
                 source = Path(source_text)
-                destination_folder = cfg.target_folder / identifier
-                destination = self._collision_safe_path(destination_folder, source.name)
-                status = "Mapped"
-                reason = ""
-                try:
-                    destination_folder.mkdir(parents=True, exist_ok=True)
-                    if not source.is_file():
-                        raise FileNotFoundError("Source file is no longer available")
-                    shutil.move(str(source), str(destination))
-                    moved += 1
-                except Exception as exc:
-                    status = "Move failed"
-                    reason = str(exc)
-
-                connection.execute(
-                    "UPDATE mapping_rows SET status = ?, reason = ? "
-                    "WHERE norm_name = ? AND status = 'Pending'",
-                    (status, reason, norm_name),
-                )
+                all_ok = True
+                for (identifier,) in connection.execute(
+                    "SELECT identifier FROM deliveries WHERE source_path = ?", (source_text,)
+                ):
+                    destination = cfg.target_folder / identifier / source.name
+                    status, reason = "Mapped", ""
+                    try:
+                        self.control.checkpoint()
+                        if not source.is_file():
+                            raise FileNotFoundError("Source file is no longer available")
+                        destination = self._deliver(source, destination.parent, destination_count == 1)
+                    except MappingCancelled:
+                        cancelled = True
+                        all_ok = False
+                        break
+                    except Exception as exc:
+                        status, reason = "Move failed", str(exc)
+                        all_ok = False
+                    connection.execute(
+                        "UPDATE deliveries SET status = ?, reason = ? "
+                        "WHERE source_path = ? AND identifier = ?",
+                        (status, reason, source_text, identifier),
+                    )
+                    writer.writerow([datetime.now().isoformat(timespec="seconds"), identifier,
+                                     source.name, str(source), str(destination), status, reason])
+                    log_file.flush()
+                if all_ok:
+                    try:
+                        if destination_count > 1:
+                            source.unlink()
+                        moved += 1
+                    except OSError as exc:
+                        connection.execute(
+                            "UPDATE deliveries SET status = 'Move failed', reason = ? "
+                            "WHERE source_path = ?", (f"Copies saved; source cleanup failed: {exc}", source_text)
+                        )
+                        writer.writerow([datetime.now().isoformat(timespec="seconds"), "", source.name,
+                                         str(source), "", "Move failed", str(exc)])
                 connection.commit()
-                writer.writerow(
-                    [
-                        datetime.now().isoformat(timespec="seconds"),
-                        identifier,
-                        source.name,
-                        str(source),
-                        str(destination),
-                        status,
-                        reason,
-                    ]
-                )
-                log_file.flush()
                 self.progress("move", index, total, f"Moved {moved:,} of {total:,} files")
+                if cancelled:
+                    break
+
+        connection.execute("""
+            UPDATE mapping_rows AS r SET
+                status = CASE
+                    WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.norm_name = r.norm_name
+                         AND d.identifier = r.identifier AND d.status = 'Move failed') THEN 'Move failed'
+                    WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.norm_name = r.norm_name
+                         AND d.identifier = r.identifier AND d.status = 'Pending') THEN 'Pending'
+                    ELSE 'Mapped' END,
+                reason = COALESCE((SELECT group_concat(d.reason, '; ') FROM deliveries d
+                    WHERE d.norm_name = r.norm_name AND d.identifier = r.identifier
+                    AND d.reason != ''), '')
+            WHERE r.status = 'Pending'
+        """)
+        connection.commit()
 
         self._write_result_workbook(connection)
         rows_mapped = int(
