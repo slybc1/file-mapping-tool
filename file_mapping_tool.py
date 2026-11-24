@@ -39,11 +39,12 @@ from mapping_core import (
     MappingEngine,
     PreviewSummary,
     TaskControl,
+    classification_columns,
     workbook_metadata,
 )
 
 
-APP_TITLE = "文件匹配与分类工具 v1.1.0"
+APP_TITLE = "文件匹配与分类工具 v1.2.0"
 
 
 class FileMappingWindow(QMainWindow):
@@ -67,9 +68,6 @@ class FileMappingWindow(QMainWindow):
         self.source_edit = QLineEdit()
         self.target_edit = QLineEdit()
         self.result_edit = QLineEdit()
-        self.case_insensitive = QCheckBox("文件名严格区分大小写（固定规则）；跨 WO 同名附件各保留一份")
-        self.case_insensitive.setChecked(False)
-        self.case_insensitive.setEnabled(False)
         self.include_subfolders = QCheckBox(
             "包含待匹配文件夹下的所有子文件夹（文件很多时会增加扫描时间）"
         )
@@ -91,7 +89,7 @@ class FileMappingWindow(QMainWindow):
         title = QLabel(APP_TITLE)
         title.setFont(QFont("Segoe UI", 18, QFont.Weight.DemiBold))
         root.addWidget(title)
-        subtitle = QLabel("自由选择 Excel 列和待匹配文件夹；先预检查，确认后再移动文件。")
+        subtitle = QLabel("选择 Excel 和待匹配文件夹，先预检查，再确认移动。")
         subtitle.setObjectName("subtitle")
         root.addWidget(subtitle)
 
@@ -112,7 +110,7 @@ class FileMappingWindow(QMainWindow):
         form.addWidget(self.include_subfolders, 5, 1, 1, 2)
         self._path_row(form, 6, "分类结果文件夹", self.target_edit, self._choose_target)
         self._path_row(form, 7, "结果 Excel", self.result_edit, self._choose_result)
-        form.addWidget(self.case_insensitive, 8, 1, 1, 2)
+        form.addWidget(QLabel("文件名和扩展名严格区分大小写。"), 8, 1, 1, 2)
         root.addWidget(setup)
 
         actions = QHBoxLayout()
@@ -182,7 +180,6 @@ class FileMappingWindow(QMainWindow):
         self.sheet_box.currentTextChanged.connect(self._sheet_changed)
         self.identifier_box.currentTextChanged.connect(self._invalidate_preview)
         self.filename_box.currentTextChanged.connect(self._invalidate_preview)
-        self.case_insensitive.stateChanged.connect(self._invalidate_preview)
         self.include_subfolders.stateChanged.connect(self._invalidate_preview)
 
     def _choose_excel(self) -> None:
@@ -213,29 +210,48 @@ class FileMappingWindow(QMainWindow):
 
     def _refresh_columns(self) -> None:
         headers = self.metadata.get(self.sheet_box.currentText(), [])
-        for box in (self.identifier_box, self.filename_box):
+        try:
+            classification = classification_columns(name for _, name in headers)
+        except ValueError:
+            classification = None  # The pre-check shows details about invalid worksheet headers.
+        reserved = set()
+        fixed_id = None
+        if classification is not None:
+            date_column, type_column, fixed_id = classification
+            reserved = {date_column, type_column}
+        id_headers = [(index, name) for index, name in headers if index not in reserved]
+        if fixed_id is not None:
+            id_headers = [(index, name) for index, name in id_headers if index == fixed_id]
+        file_headers = [
+            (index, name) for index, name in headers if index not in reserved and index != fixed_id
+        ]
+        for box, choices in ((self.identifier_box, id_headers), (self.filename_box, file_headers)):
             box.blockSignals(True)
             box.clear()
-            for index, name in headers:
+            for index, name in choices:
                 box.addItem(f"{get_column_letter(index)} 列 · {name}", index)
             box.blockSignals(False)
-        if headers:
+        self.identifier_box.setEnabled(fixed_id is None)
+        self.identifier_box.setToolTip("工作表包含 CTX_ID，已自动选为文件夹编号。" if fixed_id else "")
+        if id_headers:
             folder_index = self._suggest_column(
-                headers, ("work order", "report", "number", "no.", " id", "编号", "工单", "报告")
-            )
-            file_index = self._suggest_column(
-                headers, ("file name", "filename", "document name", "文件名", "文件名称")
+                id_headers, ("work order", "wo no", "report", "number", "no.", " id", "编号", "工单", "报告")
             )
             self.identifier_box.setCurrentIndex(folder_index)
-            self.filename_box.setCurrentIndex(
-                file_index if file_index != folder_index else (1 if len(headers) > 1 else 0)
+        if file_headers:
+            identifier = self.identifier_box.currentData()
+            file_defaults = [(index, name) for index, name in file_headers if index != identifier]
+            file_defaults = file_defaults or file_headers
+            file_index = self._suggest_column(
+                file_defaults, ("file name", "filename", "document name", "文件名", "文件名称")
             )
+            self.filename_box.setCurrentIndex(self.filename_box.findData(file_defaults[file_index][0]))
         self._invalidate_preview()
 
     @staticmethod
     def _suggest_column(headers: list[tuple[int, str]], keywords: tuple[str, ...]) -> int:
         for position, (_index, name) in enumerate(headers):
-            normalized = f" {name.casefold()} "
+            normalized = f" {name.casefold().replace('_', ' ')} "
             if any(keyword in normalized for keyword in keywords):
                 return position
         return 0
@@ -318,24 +334,26 @@ class FileMappingWindow(QMainWindow):
     def _start_move(self) -> None:
         if self.engine is None or self.preview is None:
             return
-        prompt = (
-            f"确定将 {self.preview.matched_source_files:,} 个匹配文件移动到 "
-            f"{self.preview.folders_to_create:,} 个分类文件夹吗？\n\n"
-            "同一附件对应多个 WO 时，会复制到各 WO（增加磁盘占用），全部成功后删除源文件。"
-        )
-        answer = QMessageBox.warning(
-            self,
-            APP_TITLE,
-            prompt,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        has_matches = bool(self.preview.matched_source_files)
+        if has_matches:
+            prompt = (
+                f"确定将 {self.preview.matched_source_files:,} 个匹配文件移动到 "
+                f"{self.preview.folders_to_create:,} 个编号文件夹吗？\n\n"
+                "同一附件对应多个目标文件夹时，每个文件夹会保存独立副本，全部保存后删除源文件。"
+            )
+            answer = QMessageBox.warning(
+                self,
+                APP_TITLE,
+                prompt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self.control = TaskControl()
         self.engine.control = self.control
         self._set_busy(True)
-        self.output.appendPlainText("\n正式移动已开始。\n")
+        self.output.appendPlainText("\n正式移动已开始。\n" if has_matches else "\n正在生成结果 Excel。\n")
         self.worker = threading.Thread(target=self._move_worker, daemon=True)
         self.worker.start()
 
@@ -380,7 +398,10 @@ class FileMappingWindow(QMainWindow):
                     self.preview = payload
                     self._show_preview(self.preview)
                     self._set_busy(False)
-                    self.move_button.setEnabled(bool(self.preview.matched_source_files))
+                    self.move_button.setText(
+                        "2. 确认并移动" if self.preview.matched_source_files else "2. 生成结果"
+                    )
+                    self.move_button.setEnabled(bool(self.preview.total_rows))
                 elif event == "execution":
                     self.progress_bar.setRange(0, 100)
                     self.progress_bar.setValue(100)
@@ -420,11 +441,17 @@ class FileMappingWindow(QMainWindow):
             f"未找到数据行：{summary.not_found_rows:,}\n"
             f"映射冲突数据行：{summary.conflict_rows:,}\n"
             f"无效数据行：{summary.invalid_rows:,}\n"
-            f"涉及创建的分类文件夹：{summary.folders_to_create:,}\n"
+            f"匹配文件涉及的编号文件夹：{summary.folders_to_create:,}\n"
             f"磁盘位置：{volume_note}\n"
             f"预检查耗时：{summary.elapsed_seconds:.1f} 秒\n"
         )
-        self.status_label.setText("预检查完成。请核对数量，然后确认移动。")
+        if summary.matched_source_files:
+            message = "预检查完成。请核对数量，然后确认移动。"
+        elif summary.total_rows:
+            message = "没有可移动的文件。可生成结果 Excel 查看每行状态。"
+        else:
+            message = "工作表没有可处理的数据行。"
+        self.status_label.setText(message)
 
     def _show_execution(self, summary: ExecutionSummary) -> None:
         state = "已取消" if summary.cancelled else "已完成"
@@ -452,6 +479,7 @@ class FileMappingWindow(QMainWindow):
 
     def _invalidate_preview(self) -> None:
         self.preview = None
+        self.move_button.setText("2. 确认并移动")
         self.move_button.setEnabled(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:

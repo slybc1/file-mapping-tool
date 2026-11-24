@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -30,6 +31,10 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+DATE_HEADER = "FILE_CREATE_DATETIME"
+TYPE_HEADER = "GC_CTX_TYPE_CD"
+ID_HEADER = "CTX_ID"
+YEAR_FIRST_DATE = re.compile(r"(\d{4})([-/])(\d{1,2})\2(\d{1,2})([ T].+)?")
 
 
 class MappingCancelled(RuntimeError):
@@ -122,20 +127,51 @@ def _as_text(value: object) -> str:
     return str(value).strip()
 
 
+def classification_columns(headers: Iterable[object]) -> tuple[int, int, int | None] | None:
+    """Find the columns for the automatic year and type directory layout."""
+    matches: dict[str, list[int]] = {name: [] for name in (DATE_HEADER, TYPE_HEADER, ID_HEADER)}
+    for index, value in enumerate(headers, start=1):
+        name = _as_text(value).upper()
+        if name in matches:
+            matches[name].append(index)
+    if not matches[DATE_HEADER] and not matches[TYPE_HEADER]:
+        return None
+    for name in (DATE_HEADER, TYPE_HEADER):
+        if not matches[name]:
+            raise ValueError(f"缺少分类列 {name}，按年份和业务类型分类需要两列同时存在。")
+    for name, columns in matches.items():
+        if len(columns) > 1:
+            raise ValueError(f"表头包含重复的分类列 {name}，请保留唯一一列。")
+    return matches[DATE_HEADER][0], matches[TYPE_HEADER][0], next(iter(matches[ID_HEADER]), None)
+
+
+def _classification_year(value: object) -> str:
+    if isinstance(value, date):
+        return f"{value.year:04d}"
+    if isinstance(value, str) and (match := YEAR_FIRST_DATE.fullmatch(value.strip())):
+        year, _, month, day, suffix = match.groups()
+        try:
+            parsed = datetime.fromisoformat(f"{year}-{month.zfill(2)}-{day.zfill(2)}{suffix or ''}")
+        except ValueError:
+            return ""
+        return f"{parsed.year:04d}"
+    return ""
+
+
 def normalize_filename(filename: str, case_sensitive: bool) -> str:
     # Compatibility argument retained; matching is always exact in v1.1.0.
     return filename
 
 
-def validate_identifier(value: str) -> str | None:
+def validate_identifier(value: str, label: str = "Identifier") -> str | None:
     if not value:
-        return "Identifier is blank"
+        return f"{label} is blank"
     if WINDOWS_INVALID_CHARS.search(value):
-        return "Identifier contains characters that Windows does not allow in folder names"
+        return f"{label} contains characters that Windows does not allow in folder names"
     if value.endswith((" ", ".")):
-        return "Identifier ends with a space or period, which Windows does not allow"
+        return f"{label} ends with a space or period, which Windows does not allow"
     if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
-        return "Identifier is a reserved Windows folder name"
+        return f"{label} is a reserved Windows folder name"
     return None
 
 
@@ -220,16 +256,15 @@ class MappingEngine:
             CREATE TABLE mapping_rows (
                 row_number INTEGER PRIMARY KEY,
                 identifier TEXT NOT NULL,
+                group_folder TEXT NOT NULL,
+                destination_folder TEXT NOT NULL,
                 file_name TEXT NOT NULL,
                 norm_name TEXT NOT NULL,
                 status TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
             CREATE TABLE target_names (
-                norm_name TEXT PRIMARY KEY,
-                file_name TEXT NOT NULL,
-                identifier TEXT NOT NULL,
-                conflict INTEGER NOT NULL DEFAULT 0
+                norm_name TEXT PRIMARY KEY
             );
             CREATE TABLE source_hits (
                 norm_name TEXT NOT NULL,
@@ -258,84 +293,103 @@ class MappingEngine:
             raise ValueError("The result Excel must not overwrite the original Excel")
         if cfg.identifier_column < 1 or cfg.filename_column < 1:
             raise ValueError("Column numbers must be one-based positive integers")
-        if cfg.identifier_column == cfg.filename_column:
-            raise ValueError("Identifier and file-name columns must be different")
 
     def precheck(self) -> PreviewSummary:
         started = time.perf_counter()
+        self.preview_summary = None
         self._validate_config()
         connection = self._reset_database()
         cfg = self.config
         self.progress("excel", 0, None, "Reading mapping rows")
 
-        workbook = load_workbook(cfg.excel_path, read_only=True, data_only=False)
+        workbook = load_workbook(cfg.excel_path, read_only=True, data_only=True)
         try:
             if cfg.sheet_name not in workbook.sheetnames:
                 raise ValueError(f"Worksheet not found: {cfg.sheet_name}")
             sheet = workbook[cfg.sheet_name]
-            max_column = max(cfg.identifier_column, cfg.filename_column)
+            headers = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            grouping = classification_columns(headers)
+            date_column, type_column, explicit_identifier = grouping or (None, None, None)
+            identifier_column = explicit_identifier or cfg.identifier_column
+            identifier_label = ID_HEADER if explicit_identifier is not None else "Identifier"
+            max_column = max(identifier_column, cfg.filename_column, date_column or 0, type_column or 0)
+            if identifier_column == cfg.filename_column:
+                raise ValueError("编号列与文件名列不能是同一列。")
             excel_total = sheet.max_row - 1 if isinstance(sheet.max_row, int) else None
-            batch: list[tuple[int, str, str, str, str, str]] = []
+            batch: list[tuple[int, str, str, str, str, str, str, str]] = []
+            insert_row = "INSERT INTO mapping_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             total_rows = 0
 
             for row_number, cells in enumerate(
                 sheet.iter_rows(min_row=2, max_col=max_column, values_only=True), start=2
             ):
                 self.control.checkpoint()
-                identifier = _as_text(cells[cfg.identifier_column - 1])
+                identifier = _as_text(cells[identifier_column - 1])
                 file_name = _as_text(cells[cfg.filename_column - 1])
-                if not identifier and not file_name:
+                created_at = cells[date_column - 1] if date_column is not None else None
+                type_code = _as_text(cells[type_column - 1]) if type_column is not None else ""
+                if not identifier and not file_name and not type_code and not _as_text(created_at):
                     continue
                 total_rows += 1
-                reason = validate_identifier(identifier) or validate_filename(file_name)
+                reason = validate_identifier(identifier, identifier_label) or validate_filename(file_name)
+                group_folder = ""
+                destination_folder = identifier
+                if grouping is not None and not reason:
+                    year = _classification_year(created_at)
+                    if not year:
+                        reason = f"{DATE_HEADER} 为空或日期无效，请使用 Excel 日期或年月日顺序的日期文本。"
+                    else:
+                        reason = validate_identifier(type_code, TYPE_HEADER)
+                        if not reason:
+                            group_folder = f"{year}/{type_code}"
+                            destination_folder = f"{group_folder}/{identifier}"
                 status = "Move failed" if reason else "Pending"
                 norm_name = normalize_filename(file_name, cfg.case_sensitive) if file_name else ""
-                batch.append((row_number, identifier, file_name, norm_name, status, reason or ""))
+                batch.append(
+                    (row_number, identifier, group_folder, destination_folder,
+                     file_name, norm_name, status, reason or "")
+                )
                 if len(batch) >= 5000:
-                    connection.executemany("INSERT INTO mapping_rows VALUES (?, ?, ?, ?, ?, ?)", batch)
+                    connection.executemany(insert_row, batch)
                     connection.commit()
                     batch.clear()
                     self.progress("excel", total_rows, excel_total, "Reading mapping rows")
             if batch:
-                connection.executemany("INSERT INTO mapping_rows VALUES (?, ?, ?, ?, ?, ?)", batch)
+                connection.executemany(insert_row, batch)
                 connection.commit()
         finally:
             workbook.close()
 
-        connection.execute("CREATE INDEX idx_mapping_rows_norm ON mapping_rows(norm_name)")
-        connection.execute(
-            """
-            INSERT INTO target_names(norm_name, file_name, identifier, conflict)
-            SELECT norm_name, MIN(file_name), MIN(identifier),
-                   0
-            FROM mapping_rows
-            WHERE status = 'Pending'
-            GROUP BY norm_name
-            """
-        )
         connection.create_function("windows_key", 1, str.casefold)
         connection.execute("""
-            UPDATE mapping_rows SET status = 'Mapping conflict',
-                reason = 'Different identifiers resolve to the same Windows folder'
-            WHERE windows_key(identifier) IN (
-                SELECT windows_key(identifier) FROM mapping_rows
-                WHERE status = 'Pending' GROUP BY windows_key(identifier)
-                HAVING COUNT(DISTINCT identifier) > 1
+            WITH group_conflicts AS (
+                SELECT windows_key(group_folder) FROM mapping_rows
+                WHERE status = 'Pending' AND group_folder != ''
+                GROUP BY windows_key(group_folder)
+                HAVING COUNT(DISTINCT group_folder) > 1
+            ), folder_conflicts AS (
+                SELECT windows_key(destination_folder) FROM mapping_rows
+                WHERE status = 'Pending'
+                GROUP BY windows_key(destination_folder)
+                HAVING COUNT(DISTINCT destination_folder) > 1
             )
+            UPDATE mapping_rows SET status = 'Mapping conflict',
+                reason = 'Different classifications resolve to the same Windows folder'
+            WHERE status = 'Pending'
+                AND (windows_key(group_folder) IN group_conflicts
+                    OR windows_key(destination_folder) IN folder_conflicts)
+        """)
+        connection.execute("CREATE INDEX idx_mapping_rows_norm ON mapping_rows(norm_name)")
+        connection.execute("""
+            INSERT INTO target_names(norm_name)
+            SELECT DISTINCT norm_name FROM mapping_rows WHERE status = 'Pending'
         """)
         connection.commit()
 
-        target_count = connection.execute(
-            "SELECT COUNT(*) FROM target_names WHERE conflict = 0"
-        ).fetchone()[0]
+        target_count = connection.execute("SELECT COUNT(*) FROM target_names").fetchone()[0]
         target_set: set[str] | None = None
         if target_count <= 1_000_000:
-            target_set = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT norm_name FROM target_names WHERE conflict = 0"
-                )
-            }
+            target_set = {row[0] for row in connection.execute("SELECT norm_name FROM target_names")}
 
         scope = "source folder and subfolders" if cfg.include_subfolders else "source folder"
         self.progress("scan", 0, None, f"Scanning the {scope}")
@@ -366,7 +420,7 @@ class MappingEngine:
                             norm_name = normalize_filename(entry.name, cfg.case_sensitive)
                             wanted = norm_name in target_set if target_set is not None else bool(
                                 lookup_cursor.execute(
-                                    "SELECT 1 FROM target_names WHERE norm_name = ? AND conflict = 0",
+                                    "SELECT 1 FROM target_names WHERE norm_name = ?",
                                     (norm_name,),
                                 ).fetchone()
                             )
@@ -416,7 +470,7 @@ class MappingEngine:
             conflict_rows=scalar("SELECT COUNT(*) FROM mapping_rows WHERE status = 'Mapping conflict'"),
             invalid_rows=scalar("SELECT COUNT(*) FROM mapping_rows WHERE status = 'Move failed'"),
             folders_to_create=scalar(
-                "SELECT COUNT(DISTINCT identifier) FROM mapping_rows WHERE status = 'Pending'"
+                "SELECT COUNT(DISTINCT destination_folder) FROM mapping_rows WHERE status = 'Pending'"
             ),
             same_volume=os.path.splitdrive(str(cfg.source_folder.resolve()))[0].casefold()
             == os.path.splitdrive(str(cfg.target_folder.resolve()))[0].casefold(),
@@ -477,29 +531,18 @@ class MappingEngine:
         started = time.perf_counter()
         cfg = self.config
         connection = self._connect()
-        cfg.target_folder.mkdir(parents=True, exist_ok=True)
         cfg.result_path.parent.mkdir(parents=True, exist_ok=True)
         log_path = cfg.result_path.with_name(f"{cfg.result_path.stem}_log.csv")
-        total = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM source_hits h
-                WHERE EXISTS (
-                    SELECT 1 FROM mapping_rows r
-                    WHERE r.norm_name = h.norm_name AND r.status = 'Pending'
-                )
-                """
-            ).fetchone()[0]
-        )
+        total = self.preview_summary.matched_source_files
         connection.executescript("""
             DROP TABLE IF EXISTS deliveries;
             CREATE TABLE deliveries AS
-            SELECT DISTINCT h.norm_name, r.identifier, h.source_path,
+            SELECT DISTINCT h.norm_name, r.identifier, r.destination_folder, h.source_path,
                    'Pending' AS status, '' AS reason
             FROM source_hits h JOIN mapping_rows r ON r.norm_name = h.norm_name
             WHERE r.status = 'Pending';
-            CREATE INDEX idx_deliveries_source ON deliveries(source_path);
-            CREATE INDEX idx_deliveries_row ON deliveries(norm_name, identifier);
+            CREATE INDEX idx_deliveries_source ON deliveries(source_path, destination_folder);
+            CREATE INDEX idx_deliveries_row ON deliveries(norm_name, destination_folder);
         """)
         groups = connection.execute(
             "SELECT norm_name, source_path, COUNT(*) FROM deliveries "
@@ -516,7 +559,7 @@ class MappingEngine:
                     ["Time", "Identifier", "File Name", "Source", "Destination", "Status", "Reason"]
                 )
 
-            for index, (norm_name, source_text, destination_count) in enumerate(groups, start=1):
+            for index, (_, source_text, destination_count) in enumerate(groups, start=1):
                 try:
                     self.control.checkpoint()
                 except MappingCancelled:
@@ -524,16 +567,19 @@ class MappingEngine:
                     break
                 source = Path(source_text)
                 all_ok = True
-                for (identifier,) in connection.execute(
-                    "SELECT identifier FROM deliveries WHERE source_path = ?", (source_text,)
+                for identifier, relative_folder in connection.execute(
+                    "SELECT identifier, destination_folder FROM deliveries "
+                    "WHERE source_path = ? ORDER BY destination_folder",
+                    (source_text,),
                 ):
-                    destination = cfg.target_folder / identifier / source.name
+                    folder = cfg.target_folder / relative_folder
+                    destination = folder / source.name
                     status, reason = "Mapped", ""
                     try:
                         self.control.checkpoint()
                         if not source.is_file():
                             raise FileNotFoundError("Source file is no longer available")
-                        destination = self._deliver(source, destination.parent, destination_count == 1)
+                        destination = self._deliver(source, folder, destination_count == 1)
                     except MappingCancelled:
                         cancelled = True
                         all_ok = False
@@ -543,8 +589,8 @@ class MappingEngine:
                         all_ok = False
                     connection.execute(
                         "UPDATE deliveries SET status = ?, reason = ? "
-                        "WHERE source_path = ? AND identifier = ?",
-                        (status, reason, source_text, identifier),
+                        "WHERE source_path = ? AND destination_folder = ?",
+                        (status, reason, source_text, relative_folder),
                     )
                     writer.writerow([datetime.now().isoformat(timespec="seconds"), identifier,
                                      source.name, str(source), str(destination), status, reason])
@@ -570,12 +616,14 @@ class MappingEngine:
             UPDATE mapping_rows AS r SET
                 status = CASE
                     WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.norm_name = r.norm_name
-                         AND d.identifier = r.identifier AND d.status = 'Move failed') THEN 'Move failed'
+                         AND d.destination_folder = r.destination_folder
+                         AND d.status = 'Move failed') THEN 'Move failed'
                     WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.norm_name = r.norm_name
-                         AND d.identifier = r.identifier AND d.status = 'Pending') THEN 'Pending'
+                         AND d.destination_folder = r.destination_folder
+                         AND d.status = 'Pending') THEN 'Pending'
                     ELSE 'Mapped' END,
                 reason = COALESCE((SELECT group_concat(d.reason, '; ') FROM deliveries d
-                    WHERE d.norm_name = r.norm_name AND d.identifier = r.identifier
+                    WHERE d.norm_name = r.norm_name AND d.destination_folder = r.destination_folder
                     AND d.reason != ''), '')
             WHERE r.status = 'Pending'
         """)
@@ -692,7 +740,7 @@ class MappingEngine:
 
 def workbook_metadata(path: Path) -> dict[str, list[tuple[int, str]]]:
     """Read worksheet names and first-row headers without loading the workbook into memory."""
-    workbook = load_workbook(path, read_only=True, data_only=False)
+    workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         result: dict[str, list[tuple[int, str]]] = {}
         for sheet_name in workbook.sheetnames:
