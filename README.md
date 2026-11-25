@@ -1,11 +1,18 @@
 # 文件匹配与分类工具
 
-本文件夹保存 `FileMappingTool.exe` 对应的 Python 源代码、运行依赖与打包脚本。
+文件匹配与分类工具提供 Windows 图形界面和 AIX Java 命令行版。
 
-## v1.2.0 文件包
+## AIX Java 版（v1.3.0）
 
-- `FileMappingTool-v1.2.0-Python.zip` 适合可以使用 Python 的电脑。解压后首次运行 `setup_source.bat`，之后运行 `run_source.bat`。安装、离线部署和故障排查见 [Python 运行说明](SOURCE_EDITION.md)。
-- `FileMappingTool-v1.2.0-Windows.zip` 解压后可运行 `FileMappingTool.exe`。
+AIX 版需要 Java 8 或更高版本。它会递归扫描源目录的所有子目录，按完整文件名精确匹配，并依据 Excel 中的年份、业务类型和编号归档。默认执行预检查，加入 `--apply` 后才移动文件。
+
+- [下载 AIX Java 运行包](https://github.com/slybc1/file-mapping-tool/releases/download/v1.3.0/FileMappingTool-v1.3.0-AIX-Java.zip)
+- [AIX 运行说明和命令示例](AIX-Java/README.md)
+
+## Windows 文件包（v1.2.0）
+
+- [Windows Python 运行包](https://github.com/slybc1/file-mapping-tool/releases/download/v1.2.0/FileMappingTool-v1.2.0-Python.zip)解压后先运行 `setup_source.bat`，之后运行 `run_source.bat`。安装、离线部署和故障排查见 [Python 运行说明](SOURCE_EDITION.md)。
+- [Windows EXE 运行包](https://github.com/slybc1/file-mapping-tool/releases/download/v1.2.0/FileMappingTool-v1.2.0-Windows.zip)解压后可运行 `FileMappingTool.exe`。
 
 ## 程序用途
 
