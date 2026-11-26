@@ -1,3 +1,8 @@
+# v1.3.1
+
+- AIX 版自动优先识别 `STORED_FILE_NAME`。显式指定 `--file-column` 时使用指定的列。
+- 支持 `FILE_CREATE_DATETIME` 中的 Db2 时间戳，避免把有效的归档记录判为无效。
+
 # v1.3.0
 
 - 新增 AIX Java 命令行版。运行包内含 Excel 读写依赖，使用 Java 8 或更高版本启动。

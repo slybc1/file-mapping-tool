@@ -57,7 +57,7 @@ public class FileMappingCliTest {
             "--result", result.toString()
         );
 
-        assertSuccessfulRun(args);
+        assertExitCode(args, 0);
         assertTrue(Files.isRegularFile(firstReport));
         assertTrue(Files.isRegularFile(secondReport));
         assertTrue(Files.isRegularFile(notes));
@@ -68,7 +68,7 @@ public class FileMappingCliTest {
 
         List<String> apply = new ArrayList<>(args);
         apply.add("--apply");
-        assertSuccessfulRun(apply);
+        assertExitCode(apply, 0);
 
         assertEquals("existing", contents(existing));
         assertEquals(set("Report.pdf", "Report_2.pdf", "Report_3.pdf", "Notes.txt"), fileNames(wo2025));
@@ -84,6 +84,46 @@ public class FileMappingCliTest {
         assertEquals("not an exact match", contents(caseMismatch));
         assertEquals(Arrays.asList("Mapped", "Mapped", "Mapped", "Mapped", "Mapped", "Not found"),
             rowStatuses(result));
+    }
+
+    @Test
+    public void prefersStoredFileNameAndValidatesDb2Timestamps() throws IOException {
+        Path root = temp.getRoot().toPath();
+        Path source = temp.newFolder("source").toPath();
+        Path stored = write(source.resolve("stored.csv"), "saved file");
+        Path generic = write(source.resolve("generic.csv"), "alternate file");
+        Path invalid = write(source.resolve("invalid.csv"), "invalid date");
+        Path excel = root.resolve("db2.xlsx");
+        try (XSSFWorkbook workbook = new XSSFWorkbook(); OutputStream output = Files.newOutputStream(excel)) {
+            Sheet sheet = workbook.createSheet("Export");
+            addRow(sheet, 0, "FILE_NAME", "STORED_FILE_NAME", "FILE_CREATE_DATETIME", "GC_CTX_TYPE_CD", "CTX_ID");
+            addRow(sheet, 1, "generic.csv", "stored.csv", "2016-02-07-08.09.10.123456", "COC", "1001");
+            addRow(sheet, 2, "invalid.csv", "invalid.csv", "2016-02-07-25.09.10.123456", "COC", "1002");
+            workbook.write(output);
+        }
+
+        Path target = root.resolve("target");
+        Path result = root.resolve("db2-result.xlsx");
+        List<String> options = Arrays.asList("--excel", excel.toString(), "--source", source.toString(),
+            "--target", target.toString(), "--apply");
+        List<String> automatic = new ArrayList<>(options);
+        automatic.addAll(Arrays.asList("--result", result.toString()));
+        assertExitCode(automatic, 1);
+
+        Path folder = target.resolve("2016/COC/1001");
+        assertEquals("saved file", contents(folder.resolve("stored.csv")));
+        assertFalse(Files.exists(stored));
+        assertTrue(Files.isRegularFile(generic));
+        assertTrue(Files.isRegularFile(invalid));
+        assertFalse(Files.exists(target.resolve("2016/COC/1002")));
+        assertEquals(Arrays.asList("Mapped", "Move failed"), rowStatuses(result));
+
+        List<String> explicit = new ArrayList<>(options);
+        explicit.addAll(Arrays.asList("--file-column", "FILE_NAME", "--result", root.resolve("override.xlsx").toString()));
+        assertExitCode(explicit, 1);
+        assertEquals("alternate file", contents(folder.resolve("generic.csv")));
+        assertFalse(Files.exists(generic));
+        assertTrue(Files.isRegularFile(invalid));
     }
 
     private static void writeWorkbook(Path path) throws IOException {
@@ -114,11 +154,11 @@ public class FileMappingCliTest {
         return row;
     }
 
-    private static void assertSuccessfulRun(List<String> args) throws IOException {
+    private static void assertExitCode(List<String> args, int expected) throws IOException {
         ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
         try (PrintStream stream = new PrintStream(diagnostics, true, "UTF-8")) {
             int exitCode = FileMappingCli.run(args.toArray(new String[0]), stream, stream);
-            assertEquals(diagnostics.toString("UTF-8"), 0, exitCode);
+            assertEquals(diagnostics.toString("UTF-8"), expected, exitCode);
         }
     }
 

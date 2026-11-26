@@ -1,4 +1,4 @@
-# 文件匹配与分类工具 · AIX Java 版 v1.3.0
+# 文件匹配与分类工具 · AIX Java 版 v1.3.1
 
 在 AIX 服务器的终端运行。部署包中的 `file-mapping-aix.jar` 已包含读取和写入 Excel 所需的 Apache POI 依赖。
 
@@ -47,8 +47,8 @@ java -jar file-mapping-aix.jar \
 ## Excel 和归档规则
 
 - 输入为 `.xlsx`，第一行为表头。默认使用第一张工作表，可用 `--sheet "Data"` 指定。
-- 文件名列支持常见表头，例如 `File Name`、`FILE_NAME`、`FILENAME`、`附件名称`。如需手动指定，使用 `--file-column "附件文件名"` 或 `--file-column C`。
-- `FILE_CREATE_DATETIME` 与 `GC_CTX_TYPE_CD` 同时存在时，程序自动按 `年份/业务类型/编号` 归档。日期可使用 Excel 日期或明确的年月日顺序文本，例如 `2025-12-31 23:59:59`。类型取自表格，支持 `PM`、`WO`、`EQ` 等值。
+- 文件名列优先使用 `STORED_FILE_NAME`，也支持 `File Name`、`FILE_NAME`、`FILENAME`、`附件名称` 等表头。使用 `--file-column STORED_FILE_NAME` 或 `--file-column R` 可手动指定。
+- `FILE_CREATE_DATETIME` 与 `GC_CTX_TYPE_CD` 同时存在时，程序自动按 `年份/业务类型/编号` 归档。日期支持 Excel 日期、如 `2025-12-31 23:59:59` 的日期文本，以及如 `2025-02-07-08.09.10.123456` 的 Db2 导出格式。类型取自表格，支持 `PM`、`WO`、`EQ` 等值。
 - 分组表优先使用 `CTX_ID`。缺少该列时，可用 `--id-column WO_NO` 指定编号列，或让程序识别常见表头，例如 `WO_NO`、`Work Order Number` 或 `编号`。两个分类列都缺少时采用旧表的单层编号目录。只缺一个分类列时，预检查会提示缺少的表头。
 - 同一年、同一类型、同一编号只建一个文件夹。该编号的不同附件归入同一目录。在其他年份或业务类型出现的相同编号会各自归档。
 - 默认扫描源目录及所有子目录，跳过符号链接。按完整文件名和扩展名匹配，严格区分大小写。不同位置同名的源文件都会保留，目标重名按 `_2`、`_3` 编号。

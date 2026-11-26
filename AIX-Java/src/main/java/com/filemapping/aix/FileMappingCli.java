@@ -40,6 +40,7 @@ public final class FileMappingCli {
     private static final String DATE_HEADER = "FILE_CREATE_DATETIME";
     private static final String TYPE_HEADER = "GC_CTX_TYPE_CD";
     private static final String ID_HEADER = "CTX_ID";
+    private static final String STORED_NAME_HEADER = "STORED_FILE_NAME";
     private static final Set<String> FILE_HEADERS = new HashSet<>(Arrays.asList(
             "FILENAME", "ATTACHMENT", "ATTACHMENTNAME", "ATTACHMENTFILENAME",
             "DOCNAME", "DOCUMENTNAME", "文件名", "文件名称", "附件名称", "附件文件名"));
@@ -48,6 +49,8 @@ public final class FileMappingCli {
     private static final Set<String> VALUE_OPTIONS = new HashSet<>(Arrays.asList(
             "--excel", "--sheet", "--file-column", "--id-column", "--source", "--target", "--result"));
     private static final Pattern DATE = Pattern.compile("([0-9]{4})([-/])([0-9]{1,2})\\2([0-9]{1,2})([ T].+)?");
+    private static final Pattern DB2_TIMESTAMP = Pattern.compile(
+            "([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})\\.([0-9]{2})\\.([0-9]{2})(\\.[0-9]{1,9})?");
     private static final Pattern INVALID_PATH_CHAR = Pattern.compile("[<>:\"/\\\\|?*\\x00-\\x1f]");
     private static final Pattern RESERVED_NAME = Pattern.compile(
             "(?i)(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\\..*)?");
@@ -296,6 +299,12 @@ public final class FileMappingCli {
     }
 
     private static String yearOf(String value) {
+        Matcher db2 = DB2_TIMESTAMP.matcher(value);
+        if (db2.matches()) {
+            String fraction = db2.group(5);
+            value = db2.group(1) + "T" + db2.group(2) + ":" + db2.group(3) + ":" + db2.group(4)
+                    + (fraction == null ? "" : fraction);
+        }
         Matcher match = DATE.matcher(value);
         if (!match.matches()) {
             return null;
@@ -463,7 +472,9 @@ public final class FileMappingCli {
             }
             int contextId = date >= 0 ? exact(headers, ID_HEADER) : -1;
             int id = contextId >= 0 ? contextId : choose(headers, config.idColumn, ID_HEADERS, "--id-column");
-            int filename = choose(headers, config.fileColumn, FILE_HEADERS, "--file-column");
+            int storedName = config.fileColumn == null ? exact(headers, STORED_NAME_HEADER) : -1;
+            int filename = storedName >= 0
+                    ? storedName : choose(headers, config.fileColumn, FILE_HEADERS, "--file-column");
             if (id == filename || id == date || id == type || filename == date || filename == type) {
                 throw new UsageException("Identifier, file name, date and type must use distinct columns.");
             }
